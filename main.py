@@ -2,9 +2,14 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from sentence_transformers import SentenceTransformer, util
 import pandas as pd
 import io
+import os
+import threading
 
 # FastAPI app
 app = FastAPI(title="Inventory Data Parser", description="AI-powered inventory data normalization service")
+
+# Configure Hugging Face cache to ephemeral disk (safe for Heroku dynos)
+os.environ.setdefault("HF_HOME", "/tmp/hf")
 
 # === Target schema fields ===
 standard_fields = [
@@ -41,8 +46,51 @@ field_synonyms = {
     "width": ["width", "w", "size", "dimension"],
 }
 
-# === Load embedding model ===
-model = SentenceTransformer('all-MiniLM-L6-v2')  # Fast, reasonable accuracy
+# === Lazy-loaded embedding model ===
+_model = None
+_model_lock = threading.Lock()
+_model_loading = False
+
+
+def _load_model_if_needed(non_blocking: bool = False) -> bool:
+    """Ensure the SentenceTransformer model is loaded.
+    Returns True if loaded, False if a background load has started (or is in progress).
+    """
+    global _model, _model_loading
+    if _model is not None:
+        return True
+
+    if non_blocking:
+        # Start background load if not already in progress
+        with _model_lock:
+            if _model is None and not _model_loading:
+                _model_loading = True
+                threading.Thread(target=_blocking_load_model, daemon=True).start()
+        return False
+
+    # Blocking load
+    _blocking_load_model()
+    return _model is not None
+
+
+def _blocking_load_model():
+    global _model, _model_loading
+    with _model_lock:
+        if _model is not None:
+            return
+        try:
+            _model_loading = True
+            # Small, fast model suitable for CPU-only dynos
+            _model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+        finally:
+            _model_loading = False
+
+
+# Kick off background warm-up after startup (does not block port binding)
+@app.on_event("startup")
+async def warm_up_model():
+    _load_model_if_needed(non_blocking=True)
+
 
 # === Semantic + synonym mapping function ===
 def map_columns_semantic(df, standard_fields, threshold=0.5):
@@ -68,8 +116,12 @@ def map_columns_semantic(df, standard_fields, threshold=0.5):
             for col in unmatched_user_cols
         ]
 
-        user_embeddings = model.encode(user_col_samples, convert_to_tensor=True)
-        schema_embeddings = model.encode(unmatched_standards, convert_to_tensor=True)
+        # Ensure model is loaded (blocking here). If you prefer non-blocking, return 503 when not ready.
+        if not _load_model_if_needed(non_blocking=False):
+            raise HTTPException(status_code=503, detail="Model is warming up. Please retry shortly.")
+
+        user_embeddings = _model.encode(user_col_samples, convert_to_tensor=True)
+        schema_embeddings = _model.encode(unmatched_standards, convert_to_tensor=True)
 
         for i, schema_emb in enumerate(schema_embeddings):
             scores = util.cos_sim(schema_emb, user_embeddings)[0]
@@ -81,6 +133,7 @@ def map_columns_semantic(df, standard_fields, threshold=0.5):
 
     return column_map
 
+
 # === Normalize DataFrame based on matched columns ===
 def normalize_inventory_data(df, column_map):
     normalized = {}
@@ -88,6 +141,7 @@ def normalize_inventory_data(df, column_map):
         if user_column in df.columns:
             normalized[standard_field] = df[user_column]
     return pd.DataFrame(normalized)
+
 
 # === Helper: clean values for JSON ===
 def clean_for_json(obj):
@@ -97,13 +151,16 @@ def clean_for_json(obj):
         return None
     return obj
 
+
 @app.get("/")
 async def root():
     return {"message": "Inventory Data Parser API", "status": "running"}
 
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "model_loaded": model is not None}
+    return {"status": "healthy", "model_loaded": _model is not None, "model_loading": _model_loading}
+
 
 @app.post("/parse-inventory")
 async def parse_inventory(file: UploadFile = File(...)):
@@ -113,6 +170,10 @@ async def parse_inventory(file: UploadFile = File(...)):
     try:
         if not file.filename.endswith(('.xlsx', '.xls')):
             raise HTTPException(status_code=400, detail="File must be an Excel file (.xlsx or .xls)")
+
+        # Ensure model is ready. If still loading, tell client to retry.
+        if not _load_model_if_needed(non_blocking=False):
+            raise HTTPException(status_code=503, detail="Model is warming up. Please retry shortly.")
 
         content = await file.read()
         df = pd.read_excel(io.BytesIO(content))
@@ -133,12 +194,17 @@ async def parse_inventory(file: UploadFile = File(...)):
             "standard_fields": standard_fields
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
 
 # === Example Local Run (for dev testing) ===
 if __name__ == "__main__":
     try:
+        # Optional: eager load when running locally
+        _load_model_if_needed(non_blocking=False)
         df = pd.read_excel("inventory_data.xlsx")
         column_map = map_columns_semantic(df, standard_fields)
         normalized_df = normalize_inventory_data(df, column_map)
