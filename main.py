@@ -4,6 +4,7 @@ import pandas as pd
 import io
 import os
 import threading
+import numpy as np
 
 # FastAPI app
 app = FastAPI(title="Inventory Data Parser", description="AI-powered inventory data normalization service")
@@ -120,16 +121,26 @@ def map_columns_semantic(df, standard_fields, threshold=0.5):
         if not _load_model_if_needed(non_blocking=False):
             raise HTTPException(status_code=503, detail="Model is warming up. Please retry shortly.")
 
-        user_embeddings = _model.encode(user_col_samples, convert_to_tensor=True)
-        schema_embeddings = _model.encode(unmatched_standards, convert_to_tensor=True)
+        # Use numpy arrays instead of torch tensors to reduce memory
+        user_embeddings = _model.encode(user_col_samples, convert_to_numpy=True)
+        schema_embeddings = _model.encode(unmatched_standards, convert_to_numpy=True)
 
-        for i, schema_emb in enumerate(schema_embeddings):
-            scores = util.cos_sim(schema_emb, user_embeddings)[0]
-            best_score = scores.max().item()
-            best_index = scores.argmax().item()
+        # Compute cosine similarity using numpy
+        user_norm = np.linalg.norm(user_embeddings, axis=1, keepdims=True) + 1e-12
+        schema_norm = np.linalg.norm(schema_embeddings, axis=1, keepdims=True) + 1e-12
+        normalized_user = user_embeddings / user_norm
+        normalized_schema = schema_embeddings / schema_norm
 
+        # For each schema vector, find best matching user vector
+        for i in range(normalized_schema.shape[0]):
+            scores = normalized_user @ normalized_schema[i].reshape(-1, 1)
+            best_index = int(np.argmax(scores))
+            best_score = float(scores[best_index])
             if best_score >= threshold:
                 column_map[unmatched_standards[i]] = unmatched_user_cols[best_index]
+
+        # Free embeddings explicitly
+        del user_embeddings, schema_embeddings, normalized_user, normalized_schema
 
     return column_map
 
@@ -186,6 +197,9 @@ async def parse_inventory(file: UploadFile = File(...)):
         for _, row in normalized_df.iterrows():
             clean_row = {col: clean_for_json(val) for col, val in row.items()}
             normalized_records.append(clean_row)
+
+        # Free large objects
+        del df, normalized_df
 
         return {
             "mapped_columns": column_map,

@@ -12,7 +12,6 @@ openpyxl==3.1.2
 
 # AI/ML - CPU-only wheels (no CUDA on Heroku)
 torch==2.2.2
-torchvision==0.17.2
 sentence-transformers==3.0.1
 
 # File handling
