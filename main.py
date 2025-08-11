@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import JSONResponse
 from sentence_transformers import SentenceTransformer, util
 import pandas as pd
 import io
 import os
 import threading
 import numpy as np
+from typing import Dict, List, Any, Optional
 
 # FastAPI app
 app = FastAPI(title="Inventory Data Parser", description="AI-powered inventory data normalization service")
@@ -12,39 +14,49 @@ app = FastAPI(title="Inventory Data Parser", description="AI-powered inventory d
 # Configure Hugging Face cache to ephemeral disk (safe for Heroku dynos)
 os.environ.setdefault("HF_HOME", "/tmp/hf")
 
-# === Target schema fields ===
-standard_fields = [
-    'product_name',
-    'sku',
-    'quantity',
-    'price',
-    'category',
-    'description',
-    'hs_code',
-    'country_of_origin',
-    'warehouse_location',
-    'weight',
-    'height',
-    'length',
-    'width',
-    'image_url',
+# === Target fields expected by Node ===
+TARGET_FIELDS: List[str] = [
+    "name",
+    "category",
+    "description",
+    "price",
+    "sku",
+    "hsCode",
+    "countryOfOrigin",
+    "weight",
+    "height",
+    "length",
+    "width",
+    "quantity",
 ]
 
-# === Synonym mapping for common header variations ===
-field_synonyms = {
-    "product_name": ["item", "items", "product", "product title", "product name", "name"],
-    "sku": ["sku", "item code", "product code", "id", "identifier"],
-    "quantity": ["qty", "quantity", "stock", "inventory"],
-    "price": ["amount", "price", "cost", "value", "rate"],
-    "category": ["group", "type", "department", "category", "section"],
-    "description": ["details", "description", "info", "information", "specs"],
-    "hs_code": ["hs code", "customs code", "tariff code", "import code", "export code"],
-    "country_of_origin": ["country", "origin", "made in", "manufactured in", "produced in"],
-    "warehouse_location": ["warehouse", "location", "storage", "stock", "inventory"],
-    "weight": ["weight", "wt", "mass", "size", "dimension"],
-    "height": ["height", "h", "size", "dimension"],
-    "length": ["length", "l", "size", "dimension"],
-    "width": ["width", "w", "size", "dimension"],
+# Required fields to accept the file as valid (sku and description are optional)
+REQUIRED_FIELDS: List[str] = [
+    "name",
+    "price",
+    "hsCode",
+    "countryOfOrigin",
+    "weight",
+    "height",
+    "length",
+    "width",
+    "quantity",
+]
+
+# === Synonyms for column name mapping ===
+FIELD_SYNONYMS: Dict[str, List[str]] = {
+    "name": ["name", "product name", "product", "item", "title"],
+    "category": ["category", "categories", "group", "type", "department", "section"],
+    "description": ["description", "details", "info", "information", "specs"],
+    "price": ["price", "unit price", "amount", "cost", "value", "rate"],
+    "sku": ["sku", "item code", "product code", "code", "id", "identifier"],
+    "hsCode": ["hs code", "hscode", "hs", "tariff code", "customs code"],
+    "countryOfOrigin": ["country of origin", "origin", "country", "made in", "manufactured in"],
+    "weight": ["weight", "wt", "mass"],
+    "height": ["height", "h"],
+    "length": ["length", "l"],
+    "width": ["width", "w"],
+    "quantity": ["quantity", "qty", "stock", "inventory", "available"],
 }
 
 # === Lazy-loaded embedding model ===
@@ -93,74 +105,141 @@ async def warm_up_model():
     _load_model_if_needed(non_blocking=True)
 
 
-# === Semantic + synonym mapping function ===
-def map_columns_semantic(df, standard_fields, threshold=0.5):
-    user_columns = list(df.columns)
-    column_map = {}
+# === Utility: safe numeric coercion (tolerates units like '5L', '2.5kg') ===
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            s = value.strip().replace(",", "")
+            if s == "":
+                return None
+            # Extract first numeric token (optional sign, digits, optional decimal)
+            import re
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+            if not m:
+                return None
+            return float(m.group(0))
+        # Fallback: try casting generically
+        return float(value)
+    except Exception:
+        return None
 
-    # 1. Try matching based on field_synonyms
-    for standard in standard_fields:
-        synonyms = field_synonyms.get(standard, [])
-        for user_col in user_columns:
-            if user_col.lower() in [s.lower() for s in synonyms]:
-                column_map[standard] = user_col
+
+def _to_int(value: Any) -> Optional[int]:
+    f = _to_float(value)
+    if f is None:
+        return None
+    try:
+        i = int(round(f))
+        return i
+    except Exception:
+        return None
+
+
+# === Column mapping via synonyms + semantic fallback ===
+def _build_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    user_columns = list(df.columns)
+    lower_user = {c.lower(): c for c in user_columns}
+
+    column_map: Dict[str, Optional[str]] = {field: None for field in TARGET_FIELDS}
+
+    # 1) Exact/synonym match first
+    for field, synonyms in FIELD_SYNONYMS.items():
+        for syn in synonyms:
+            if syn.lower() in lower_user:
+                column_map[field] = lower_user[syn.lower()]
                 break
 
-    # 2. Prepare remaining fields and columns for embedding comparison
-    unmatched_standards = [f for f in standard_fields if f not in column_map]
-    unmatched_user_cols = [c for c in user_columns if c not in column_map.values()]
+    # 2) Semantic fallback for unmapped fields
+    unmapped_fields = [f for f, c in column_map.items() if c is None]
+    candidate_columns = [c for c in user_columns if c not in column_map.values()]
 
-    if unmatched_standards and unmatched_user_cols:
-        # Use column names + sample data to enrich embeddings
-        user_col_samples = [
-            f"{col}: {df[col].astype(str).dropna().head(3).tolist()}"
-            for col in unmatched_user_cols
-        ]
-
-        # Ensure model is loaded (blocking here). If you prefer non-blocking, return 503 when not ready.
+    if unmapped_fields and candidate_columns:
         if not _load_model_if_needed(non_blocking=False):
-            raise HTTPException(status_code=503, detail="Model is warming up. Please retry shortly.")
+            # Model should be loaded by now; if not, treat as missing mappings
+            return column_map
 
-        # Use numpy arrays instead of torch tensors to reduce memory
-        user_embeddings = _model.encode(user_col_samples, convert_to_numpy=True)
-        schema_embeddings = _model.encode(unmatched_standards, convert_to_numpy=True)
+        # Describe candidate columns with small data samples for better signals
+        user_col_samples = []
+        for col in candidate_columns:
+            try:
+                sample = df[col].astype(str).dropna().head(3).tolist()
+            except Exception:
+                sample = []
+            user_col_samples.append(f"{col}: {sample}")
 
-        # Compute cosine similarity using numpy
-        user_norm = np.linalg.norm(user_embeddings, axis=1, keepdims=True) + 1e-12
-        schema_norm = np.linalg.norm(schema_embeddings, axis=1, keepdims=True) + 1e-12
-        normalized_user = user_embeddings / user_norm
-        normalized_schema = schema_embeddings / schema_norm
+        user_emb = _model.encode(user_col_samples, convert_to_numpy=True)
+        field_emb = _model.encode(unmapped_fields, convert_to_numpy=True)
 
-        # For each schema vector, find best matching user vector
-        for i in range(normalized_schema.shape[0]):
-            scores = normalized_user @ normalized_schema[i].reshape(-1, 1)
-            best_index = int(np.argmax(scores))
-            best_score = float(scores[best_index])
+        # Normalize
+        user_norm = np.linalg.norm(user_emb, axis=1, keepdims=True) + 1e-12
+        field_norm = np.linalg.norm(field_emb, axis=1, keepdims=True) + 1e-12
+        user_n = user_emb / user_norm
+        field_n = field_emb / field_norm
+
+        threshold = 0.5  # conservative
+        for i, field in enumerate(unmapped_fields):
+            scores = (user_n @ field_n[i].reshape(-1, 1)).ravel()
+            best_idx = int(np.argmax(scores))
+            best_score = float(scores[best_idx])
             if best_score >= threshold:
-                column_map[unmatched_standards[i]] = unmatched_user_cols[best_index]
+                column_map[field] = candidate_columns[best_idx]
 
-        # Free embeddings explicitly
-        del user_embeddings, schema_embeddings, normalized_user, normalized_schema
+        # Free large arrays
+        del user_emb, field_emb, user_n, field_n
 
     return column_map
 
 
-# === Normalize DataFrame based on matched columns ===
-def normalize_inventory_data(df, column_map):
-    normalized = {}
-    for standard_field, user_column in column_map.items():
-        if user_column in df.columns:
-            normalized[standard_field] = df[user_column]
-    return pd.DataFrame(normalized)
+def _normalize_category(value: Any) -> List[str]:
+    if value is None:
+        return ["Other"]
+    if isinstance(value, list):
+        out = [str(v).strip() for v in value if str(v).strip()]
+        return out or ["Other"]
+    text = str(value).strip()
+    if not text:
+        return ["Other"]
+    # Split on common delimiters
+    parts = [p.strip() for p in re_split(text)]
+    parts = [p for p in parts if p]
+    return parts or ["Other"]
 
 
-# === Helper: clean values for JSON ===
-def clean_for_json(obj):
-    if pd.isna(obj):
-        return None
-    elif isinstance(obj, (float, int)) and (pd.isna(obj) or (isinstance(obj, float) and (obj == float('inf') or obj == float('-inf')))):
-        return None
-    return obj
+def re_split(text: str) -> List[str]:
+    # Helper separated to avoid importing re at module import (keeps startup fast)
+    import re
+    return re.split(r"[,;|]", text)
+
+
+def _row_errors(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    errs: List[Dict[str, Any]] = []
+
+    def add(field: str, msg: str):
+        errs.append({"row": row_idx, "field": field, "message": msg})
+
+    # Required presence
+    for field in REQUIRED_FIELDS:
+        if row.get(field) in (None, ""):
+            add(field, "required")
+
+    # Type/constraints
+    if row.get("price") is not None and (not isinstance(row["price"], (int, float)) or row["price"] < 0):
+        add("price", "must be a non-negative number")
+    for dim in ["weight", "height", "length", "width"]:
+        if row.get(dim) is not None and (not isinstance(row[dim], (int, float)) or row[dim] < 0):
+            add(dim, "must be a non-negative number")
+    if row.get("quantity") is not None and (not isinstance(row["quantity"], int) or row["quantity"] < 0):
+        add("quantity", "must be a non-negative integer")
+
+    # Category must be non-empty array
+    if not isinstance(row.get("category"), list) or len(row["category"]) == 0:
+        add("category", "must be a non-empty list")
+
+    return errs
 
 
 @app.get("/")
@@ -176,58 +255,113 @@ async def health_check():
 @app.post("/parse-inventory")
 async def parse_inventory(file: UploadFile = File(...)):
     """
-    Parse and normalize inventory data from uploaded Excel file
+    Parse and normalize inventory data from uploaded Excel file.
+    Returns 200 with products[] ready for Node import, or 422 with row-level errors.
     """
     try:
-        if not file.filename.endswith(('.xlsx', '.xls')):
-            raise HTTPException(status_code=400, detail="File must be an Excel file (.xlsx or .xls)")
-
-        # Ensure model is ready. If still loading, tell client to retry.
-        if not _load_model_if_needed(non_blocking=False):
-            raise HTTPException(status_code=503, detail="Model is warming up. Please retry shortly.")
+        filename = (file.filename or "").lower()
+        if not filename.endswith((".xlsx", ".xls")):
+            return JSONResponse(status_code=400, content={"message": "File must be an Excel file (.xlsx or .xls)"})
 
         content = await file.read()
-        df = pd.read_excel(io.BytesIO(content))
+        try:
+            df = pd.read_excel(io.BytesIO(content))
+        except Exception:
+            return JSONResponse(status_code=400, content={"message": "Failed to read Excel file"})
 
-        user_columns = list(df.columns)
-        column_map = map_columns_semantic(df, standard_fields)
-        normalized_df = normalize_inventory_data(df, column_map)
+        # Drop fully empty rows/columns
+        df = df.dropna(axis=0, how='all')
+        df = df.dropna(axis=1, how='all')
+        if df.shape[0] == 0:
+            return JSONResponse(status_code=422, content={"errors": [{"row": None, "field": "file", "message": "No data rows found"}]})
 
-        normalized_records = []
-        for _, row in normalized_df.iterrows():
-            clean_row = {col: clean_for_json(val) for col, val in row.items()}
-            normalized_records.append(clean_row)
+        # Build column map
+        column_map = _build_column_map(df)
 
-        # Free large objects
-        del df, normalized_df
+        # Validate required mappings exist
+        missing_required_cols = [f for f in REQUIRED_FIELDS if column_map.get(f) is None]
+        if missing_required_cols:
+            return JSONResponse(status_code=422, content={
+                "errors": [
+                    {"row": None, "field": f, "message": "required column not found"}
+                    for f in missing_required_cols
+                ]
+            })
 
-        return {
-            "mapped_columns": column_map,
-            "normalized_data": normalized_records,
-            "original_columns": user_columns,
-            "standard_fields": standard_fields
-        }
+        # Build normalized products
+        products: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for idx in range(len(df)):
+            row_src = df.iloc[idx]
+
+            def get_val(field: str) -> Any:
+                col = column_map.get(field)
+                if not col:
+                    return None
+                try:
+                    return row_src[col]
+                except Exception:
+                    return None
+
+            # Extract and normalize
+            name = str(get_val("name")).strip() if get_val("name") is not None else None
+            category_raw = get_val("category")
+            category = _normalize_category(category_raw)
+            description_raw = get_val("description")
+            description = None if description_raw is None or str(description_raw).strip() == "" else str(description_raw).strip()
+            price = _to_float(get_val("price"))
+            sku_raw = get_val("sku")
+            sku = None if sku_raw is None or str(sku_raw).strip() == "" else str(sku_raw).strip()
+            hs_code = None if get_val("hsCode") is None else str(get_val("hsCode")).strip()
+            country = None if get_val("countryOfOrigin") is None else str(get_val("countryOfOrigin")).strip()
+            weight = _to_float(get_val("weight"))
+            height = _to_float(get_val("height"))
+            length = _to_float(get_val("length"))
+            width = _to_float(get_val("width"))
+            quantity = _to_int(get_val("quantity"))
+
+            product_obj = {
+                "name": name,
+                "category": category,
+                "description": description,
+                "price": price,
+                # Include sku only if present
+                **({"sku": sku} if sku else {}),
+                "hsCode": hs_code,
+                "countryOfOrigin": country,
+                "weight": weight,
+                "height": height,
+                "length": length,
+                "width": width,
+                "quantity": quantity,
+            }
+
+            row_errs = _row_errors(idx + 2, product_obj)  # +2 because Excel data typically starts at row 2 (after header)
+            if row_errs:
+                errors.extend(row_errs)
+            else:
+                products.append(product_obj)
+
+        if errors:
+            return JSONResponse(status_code=422, content={"errors": errors})
+
+        return {"products": products}
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+        # Unexpected server error
+        return JSONResponse(status_code=500, content={"message": f"Error processing file: {str(e)}"})
 
 
 # === Example Local Run (for dev testing) ===
 if __name__ == "__main__":
     try:
-        # Optional: eager load when running locally
         _load_model_if_needed(non_blocking=False)
         df = pd.read_excel("inventory_data.xlsx")
-        column_map = map_columns_semantic(df, standard_fields)
-        normalized_df = normalize_inventory_data(df, column_map)
-
-        print("Mapped Columns:")
-        print(column_map)
-        print("\nNormalized DataFrame:")
-        print(normalized_df)
-
+        # Simulate file processing via endpoint logic if needed
+        print(f"Loaded {len(df)} rows for local testing")
     except FileNotFoundError:
         print("File not found.")
     except Exception as e:
