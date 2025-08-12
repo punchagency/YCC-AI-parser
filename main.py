@@ -510,7 +510,7 @@ def _friendly_missing_columns_message(missing_fields: List[str]) -> Dict[str, An
     }
 
 
-def _friendly_row_errors_message(errors: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _friendly_row_errors_message(errors: List[Dict[str, Any]], column_map: Dict[str, Optional[str]]) -> Dict[str, Any]:
     # Group by field + message
     from collections import defaultdict
 
@@ -519,11 +519,20 @@ def _friendly_row_errors_message(errors: List[Dict[str, Any]]) -> Dict[str, Any]
         row = err.get("row")
         field = err.get("field")
         msg = err.get("message")
+        original_field_name = column_map.get(field)
+        if original_field_name:
+            label = original_field_name
+        else:
+            label = FIELD_LABELS.get(field, field)
         grouped[field][msg].append(row)
 
     bullets = []
     for field, msgs in grouped.items():
-        label = FIELD_LABELS.get(field, field)
+        original_field_name = column_map.get(field)
+        if original_field_name:
+            label = original_field_name
+        else:
+            label = FIELD_LABELS.get(field, field)
         for msg, rows in msgs.items():
             sample = ", ".join(str(r) for r in rows[:5])
             count = len(rows)
@@ -534,7 +543,7 @@ def _friendly_row_errors_message(errors: List[Dict[str, Any]]) -> Dict[str, Any]
             bullets.append(f"- {human}")
 
     title = "Some rows need attention before I can import."
-    hint = "Tip: Fix the highlighted issues and re-upload. We'll validate again instantly."
+    hint = "Tip: Fix the highlighted issues and re-upload. I'll validate again instantly."
     return {
         "title": title,
         "bullets": bullets,
@@ -660,7 +669,7 @@ async def parse_inventory(file: UploadFile = File(...)):
                 products.append(product_obj)
 
         if errors:
-            friendly = _friendly_row_errors_message(errors)
+            friendly = _friendly_row_errors_message(errors, column_map)
             return JSONResponse(status_code=422, content={
                 "message": friendly["message"],
                 "errors": errors,
