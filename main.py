@@ -440,17 +440,15 @@ def _build_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
 
 
 def _normalize_category(value: Any) -> List[str]:
-    if value is None:
+    if pd.isna(value) or (isinstance(value, str) and value.strip().lower() in ('', 'nan', 'none')):
         return ["Other"]
     if isinstance(value, list):
-        out = [str(v).strip() for v in value if str(v).strip()]
+        out = [str(v).strip() for v in value if str(v).strip() and str(v).strip().lower() != 'nan']
         return out or ["Other"]
     text = str(value).strip()
-    if not text:
+    if not text or text.lower() == 'nan':
         return ["Other"]
-    # Split on common delimiters
-    parts = [p.strip() for p in re_split(text)]
-    parts = [p for p in parts if p]
+    parts = [p.strip() for p in re_split(text) if p.strip() and p.strip().lower() != 'nan']
     return parts or ["Other"]
 
 
@@ -466,12 +464,12 @@ def _row_errors(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
     def add(field: str, msg: str):
         errs.append({"row": row_idx, "field": field, "message": msg})
 
-    # Required presence
+    # Required presence (only for REQUIRED_FIELDS)
     for field in REQUIRED_FIELDS:
-        if row.get(field) in (None, ""):
+        if row.get(field) is None:
             add(field, "required")
 
-    # Type/constraints
+    # Type/constraints (same as before, but only if value present)
     if row.get("price") is not None and (not isinstance(row["price"], (int, float)) or row["price"] < 0):
         add("price", "must be a non-negative number")
     for dim in ["weight", "height", "length", "width"]:
@@ -480,7 +478,7 @@ def _row_errors(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
     if row.get("quantity") is not None and (not isinstance(row["quantity"], int) or row["quantity"] < 0):
         add("quantity", "must be a non-negative integer")
 
-    # Category must be non-empty array
+    # Category must be non-empty array (but since we default to ["Other"], it shouldn't trigger)
     if not isinstance(row.get("category"), list) or len(row["category"]) == 0:
         add("category", "must be a non-empty list")
 
@@ -498,7 +496,7 @@ def _friendly_missing_columns_message(missing_fields: List[str]) -> Dict[str, An
         else:
             bullets.append(f"- {label}")
 
-    title = "We couldn't find some required columns."
+    title = "I couldn't find some required columns."
     hint = (
         "Tip: Use clear headers. You can rename your columns to match the suggested examples above, "
         "then re-upload."
@@ -535,7 +533,7 @@ def _friendly_row_errors_message(errors: List[Dict[str, Any]]) -> Dict[str, Any]
                 human = f"{label} {msg} on {count} row(s) (e.g., row {sample})."
             bullets.append(f"- {human}")
 
-    title = "Some rows need attention before we can import."
+    title = "Some rows need attention before I can import."
     hint = "Tip: Fix the highlighted issues and re-upload. We'll validate again instantly."
     return {
         "title": title,
@@ -577,9 +575,9 @@ async def parse_inventory(file: UploadFile = File(...)):
         df = df.dropna(axis=1, how='all')
         if df.shape[0] == 0:
             friendly = {
-                "title": "We couldn't find any data rows.",
+                "title": "I couldn't find any data rows.",
                 "bullets": ["Make sure your sheet has a header row and at least one data row."],
-                "message": "We couldn't find any data rows. Make sure your sheet has a header row and at least one data row.",
+                "message": "I couldn't find any data rows. Make sure your sheet has a header row and at least one data row.",
             }
             return JSONResponse(status_code=422, content={
                 "message": friendly["message"],
@@ -615,7 +613,10 @@ async def parse_inventory(file: UploadFile = File(...)):
                 if not col:
                     return None
                 try:
-                    return row_src[col]
+                    val = row_src[col]
+                    if pd.isna(val) or (isinstance(val, str) and val.strip().lower() in ('', 'nan', 'none')):
+                        return None
+                    return val
                 except Exception:
                     return None
 
@@ -672,10 +673,13 @@ async def parse_inventory(file: UploadFile = File(...)):
                 return None
             if isinstance(obj, float):
                 return obj if math.isfinite(obj) else None
+            if isinstance(obj, str) and obj.strip().lower() in ('nan', 'none'):
+                return None
             if isinstance(obj, (list, tuple)):
-                return [_clean(x) for x in obj]
+                cleaned = [_clean(x) for x in obj if _clean(x) is not None]
+                return cleaned if cleaned else None
             if isinstance(obj, dict):
-                return {k: _clean(v) for k, v in obj.items()}
+                return {k: _clean(v) for k, v in obj.items() if _clean(v) is not None}
             return obj
 
         safe_products = [_clean(p) for p in products]
