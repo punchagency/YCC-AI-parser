@@ -7,9 +7,28 @@ import os
 import threading
 import numpy as np
 from typing import Dict, List, Any, Optional
+import math
+import difflib
+import re
+from fastapi.middleware.cors import CORSMiddleware
 
 # FastAPI app
 app = FastAPI(title="Inventory Data Parser", description="AI-powered inventory data normalization service")
+
+# CORS for browser clients
+allowed_origins_env = os.environ.get("CORS_ORIGINS")
+allowed_origins = (
+    [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
+    if allowed_origins_env
+    else ["http://localhost:3000", "https://yachtcrewcenter.com"]
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configure Hugging Face cache to ephemeral disk (safe for Heroku dynos)
 os.environ.setdefault("HF_HOME", "/tmp/hf")
@@ -45,18 +64,95 @@ REQUIRED_FIELDS: List[str] = [
 
 # === Synonyms for column name mapping ===
 FIELD_SYNONYMS: Dict[str, List[str]] = {
-    "name": ["name", "product name", "product", "item", "title"],
-    "category": ["category", "categories", "group", "type", "department", "section"],
-    "description": ["description", "details", "info", "information", "specs"],
-    "price": ["price", "unit price", "amount", "cost", "value", "rate"],
-    "sku": ["sku", "item code", "product code", "code", "id", "identifier"],
-    "hsCode": ["hs code", "hscode", "hs", "tariff code", "customs code"],
-    "countryOfOrigin": ["country of origin", "origin", "country", "made in", "manufactured in"],
-    "weight": ["weight", "wt", "mass"],
+    "name": [
+        "name",
+        "product name",
+        "product",
+        "item",
+        "item name",
+        "title",
+        "product title",
+        "product label",
+        "item title",
+        "product description title",
+    ],
+    "category": [
+        "category",
+        "categories",
+        "group",
+        "type",
+        "department",
+        "section",
+        "collection",
+    ],
+    "description": [
+        "description",
+        "details",
+        "info",
+        "information",
+        "specs",
+        "specifications",
+        "product details",
+    ],
+    "price": [
+        "price",
+        "unit price",
+        "amount",
+        "cost",
+        "value",
+        "rate",
+        "selling price",
+        "list price",
+    ],
+    "sku": [
+        "sku",
+        "item code",
+        "product code",
+        "code",
+        "id",
+        "identifier",
+        "sku code",
+        "stock keeping unit",
+    ],
+    "hsCode": [
+        "hs code",
+        "hscode",
+        "hs",
+        "tariff code",
+        "customs code",
+        "harmonized code",
+        "hs number",
+    ],
+    "countryOfOrigin": [
+        "country of origin",
+        "origin",
+        "country",
+        "made in",
+        "manufactured in",
+        "origin country",
+        "coo",
+    ],
+    "weight": ["weight", "wt", "mass", "net weight", "gross weight"],
     "height": ["height", "h"],
     "length": ["length", "l"],
     "width": ["width", "w"],
-    "quantity": ["quantity", "qty", "stock", "inventory", "available"],
+    "quantity": ["quantity", "qty", "stock", "inventory", "available", "qtty"],
+}
+
+# Nicer display labels for fields
+FIELD_LABELS: Dict[str, str] = {
+    "name": "Name",
+    "category": "Category",
+    "description": "Description",
+    "price": "Price",
+    "sku": "SKU",
+    "hsCode": "HS Code",
+    "countryOfOrigin": "Country of Origin",
+    "weight": "Weight",
+    "height": "Height",
+    "length": "Length",
+    "width": "Width",
+    "quantity": "Quantity",
 }
 
 # === Lazy-loaded embedding model ===
@@ -111,7 +207,8 @@ def _to_float(value: Any) -> Optional[float]:
         if value is None:
             return None
         if isinstance(value, (int, float)):
-            return float(value)
+            f = float(value)
+            return f if math.isfinite(f) else None
         if isinstance(value, str):
             s = value.strip().replace(",", "")
             if s == "":
@@ -121,9 +218,11 @@ def _to_float(value: Any) -> Optional[float]:
             m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
             if not m:
                 return None
-            return float(m.group(0))
+            f = float(m.group(0))
+            return f if math.isfinite(f) else None
         # Fallback: try casting generically
-        return float(value)
+        f = float(value)
+        return f if math.isfinite(f) else None
     except Exception:
         return None
 
@@ -140,56 +239,202 @@ def _to_int(value: Any) -> Optional[int]:
 
 
 # === Column mapping via synonyms + semantic fallback ===
+def _normalize_header(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = re.sub(r"[\s_\-]+", " ", t)
+    t = re.sub(r"[^a-z0-9 ]+", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _tokenize(text: str) -> List[str]:
+    return [tok for tok in _normalize_header(text).split(" ") if tok]
+
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a), set(b)
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+
+def _string_sim(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, _normalize_header(a), _normalize_header(b)).ratio()
+
+
+def _column_features(series: pd.Series) -> Dict[str, Any]:
+    n = int(series.shape[0])
+    sample = series.dropna().astype(str).head(200).tolist()
+    if n == 0:
+        return {
+            "p_numeric": 0.0,
+            "p_integer": 0.0,
+            "avg_len": 0.0,
+            "hs_like": 0.0,
+            "has_weight_units": 0.0,
+            "low_cardinality": False,
+        }
+    numeric_flags = []
+    integer_flags = []
+    lengths = []
+    hs_hits = 0
+    unit_hits = 0
+    for v in sample:
+        s = str(v).strip()
+        lengths.append(len(s))
+        # numeric
+        try:
+            float_val = float(re.sub(r"[^0-9.\-]", "", s)) if re.search(r"\d", s) else None
+        except Exception:
+            float_val = None
+        numeric_flags.append(1 if float_val is not None else 0)
+        if float_val is not None:
+            integer_flags.append(1 if abs(float_val - round(float_val)) < 1e-9 else 0)
+        else:
+            integer_flags.append(0)
+        # hs-like: 4-10 consecutive digits possibly with spaces/hyphens
+        if re.search(r"\b\d{4,10}\b", s):
+            hs_hits += 1
+        # weight units
+        if re.search(r"\b(kg|g|gram|grams|lb|lbs|pound|oz|ounce|ounces)\b", s, re.I):
+            unit_hits += 1
+    unique_ratio = len(set(sample)) / max(1, len(sample))
+    return {
+        "p_numeric": sum(numeric_flags) / max(1, len(sample)),
+        "p_integer": sum(integer_flags) / max(1, len(sample)),
+        "avg_len": sum(lengths) / max(1, len(lengths)),
+        "hs_like": hs_hits / max(1, len(sample)),
+        "has_weight_units": unit_hits / max(1, len(sample)),
+        "low_cardinality": unique_ratio < 0.5,
+    }
+
+
+def _heuristic_boost(field: str, features: Dict[str, Any]) -> float:
+    boost = 0.0
+    if field == "price":
+        if features["p_numeric"] > 0.8 and features["p_integer"] < 0.9:
+            boost += 0.2
+    if field == "quantity":
+        if features["p_numeric"] > 0.8 and features["p_integer"] > 0.8:
+            boost += 0.25
+    if field in {"weight", "height", "length", "width"}:
+        if features["p_numeric"] > 0.75:
+            boost += 0.2
+        if field == "weight" and features["has_weight_units"] > 0.05:
+            boost += 0.2
+    if field == "hsCode":
+        if features["hs_like"] > 0.1 and features["p_numeric"] > 0.5:
+            boost += 0.3
+    if field == "category":
+        if features["low_cardinality"] and features["p_numeric"] < 0.3:
+            boost += 0.15
+    if field == "name":
+        if features["p_numeric"] < 0.2 and features["avg_len"] >= 3:
+            boost += 0.2
+    return boost
+
+
 def _build_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     user_columns = list(df.columns)
-    lower_user = {c.lower(): c for c in user_columns}
+    normalized_to_original = { _normalize_header(c): c for c in user_columns }
+    normalized_user_headers = list(normalized_to_original.keys())
 
     column_map: Dict[str, Optional[str]] = {field: None for field in TARGET_FIELDS}
 
-    # 1) Exact/synonym match first
-    for field, synonyms in FIELD_SYNONYMS.items():
-        for syn in synonyms:
-            if syn.lower() in lower_user:
-                column_map[field] = lower_user[syn.lower()]
+    # Pass 1: exact/synonym match on normalized headers
+    normalized_synonyms: Dict[str, List[str]] = {
+        f: [_normalize_header(s) for s in syns] for f, syns in FIELD_SYNONYMS.items()
+    }
+    for field, syns in normalized_synonyms.items():
+        for h_norm in normalized_user_headers:
+            if h_norm in syns:
+                column_map[field] = normalized_to_original[h_norm]
                 break
 
-    # 2) Semantic fallback for unmapped fields
+    # Prepare candidates not yet used
     unmapped_fields = [f for f, c in column_map.items() if c is None]
     candidate_columns = [c for c in user_columns if c not in column_map.values()]
 
-    if unmapped_fields and candidate_columns:
-        if not _load_model_if_needed(non_blocking=False):
-            # Model should be loaded by now; if not, treat as missing mappings
-            return column_map
+    # Precompute features for candidates
+    col_features: Dict[str, Dict[str, Any]] = {
+        col: _column_features(df[col]) for col in candidate_columns
+    }
 
-        # Describe candidate columns with small data samples for better signals
-        user_col_samples = []
+    # Precompute tokens of field labels
+    field_label_tokens = { f: _tokenize(FIELD_LABELS.get(f, f)) for f in unmapped_fields }
+
+    # Pass 2: fuzzy token/string similarity
+    scores: List[tuple] = []  # (score, field, col)
+    for field in unmapped_fields:
         for col in candidate_columns:
-            try:
-                sample = df[col].astype(str).dropna().head(3).tolist()
-            except Exception:
-                sample = []
-            user_col_samples.append(f"{col}: {sample}")
+            h = col
+            # token overlap vs the best of field label or any synonym
+            tokens_h = _tokenize(h)
+            best_tok = max([
+                _jaccard(tokens_h, _tokenize(p))
+                for p in [FIELD_LABELS.get(field, field)] + FIELD_SYNONYMS.get(field, [])
+            ] or [0.0])
+            best_str = max([
+                _string_sim(h, p)
+                for p in [FIELD_LABELS.get(field, field)] + FIELD_SYNONYMS.get(field, [])
+            ] or [0.0])
+            base = 0.35 * best_tok + 0.35 * best_str
+            base += _heuristic_boost(field, col_features[col])
+            if base > 0:
+                scores.append((base, field, col))
 
-        user_emb = _model.encode(user_col_samples, convert_to_numpy=True)
-        field_emb = _model.encode(unmapped_fields, convert_to_numpy=True)
+    # Pass 3: semantic similarity with header-only weighting
+    if unmapped_fields and candidate_columns:
+        if _load_model_if_needed(non_blocking=False):
+            # Encode candidate headers
+            header_texts = [ _normalize_header(c) for c in candidate_columns ]
+            cand_emb = _model.encode(header_texts, convert_to_numpy=True)
+            cand_norm = np.linalg.norm(cand_emb, axis=1, keepdims=True) + 1e-12
+            cand_n = cand_emb / cand_norm
 
-        # Normalize
-        user_norm = np.linalg.norm(user_emb, axis=1, keepdims=True) + 1e-12
-        field_norm = np.linalg.norm(field_emb, axis=1, keepdims=True) + 1e-12
-        user_n = user_emb / user_norm
-        field_n = field_emb / field_norm
+            for field in unmapped_fields:
+                phrases = [FIELD_LABELS.get(field, field)] + FIELD_SYNONYMS.get(field, [])
+                field_emb = _model.encode([_normalize_header(p) for p in phrases], convert_to_numpy=True)
+                field_norm = np.linalg.norm(field_emb, axis=1, keepdims=True) + 1e-12
+                field_n = field_emb / field_norm
+                # Use the best phrase score for the field
+                # cosine matrix: candidates x phrases
+                cos = cand_n @ field_n.T
+                best_per_cand = cos.max(axis=1)
+                for idx, col in enumerate(candidate_columns):
+                    sem = float(best_per_cand[idx])
+                    if sem > 0:
+                        score = 0.8 * sem + _heuristic_boost(field, col_features[col])
+                        scores.append((score, field, col))
 
-        threshold = 0.5  # conservative
-        for i, field in enumerate(unmapped_fields):
-            scores = (user_n @ field_n[i].reshape(-1, 1)).ravel()
-            best_idx = int(np.argmax(scores))
-            best_score = float(scores[best_idx])
-            if best_score >= threshold:
-                column_map[field] = candidate_columns[best_idx]
+            # Free embeddings
+            del cand_emb, cand_norm, cand_n
 
-        # Free large arrays
-        del user_emb, field_emb, user_n, field_n
+    # Aggregate and choose assignments greedily by highest score with threshold
+    # Sum scores across passes
+    from collections import defaultdict
+    agg: Dict[tuple, float] = defaultdict(float)
+    for s, f, c in scores:
+        agg[(f, c)] += s
+
+    assignments = []
+    used_fields = set()
+    used_cols = set()
+    # Sort by score descending
+    for (f, c), s in sorted(agg.items(), key=lambda x: x[1], reverse=True):
+        # Minimum acceptance threshold
+        if s < 0.85:
+            continue
+        if f in used_fields or c in used_cols:
+            continue
+        assignments.append((f, c, s))
+        used_fields.add(f)
+        used_cols.add(c)
+
+    for f, c, _ in assignments:
+        column_map[f] = c
 
     return column_map
 
@@ -242,6 +487,64 @@ def _row_errors(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
     return errs
 
 
+def _friendly_missing_columns_message(missing_fields: List[str]) -> Dict[str, Any]:
+    bullets = []
+    for f in missing_fields:
+        label = FIELD_LABELS.get(f, f)
+        syns = FIELD_SYNONYMS.get(f, [])
+        syns_preview = ", ".join(syns[:4]) if syns else None
+        if syns_preview:
+            bullets.append(f"- {label}: try one of → {syns_preview}")
+        else:
+            bullets.append(f"- {label}")
+
+    title = "We couldn't find some required columns."
+    hint = (
+        "Tip: Use clear headers. You can rename your columns to match the suggested examples above, "
+        "then re-upload."
+    )
+    # Do not inject bullets into message to avoid duplicate rendering client-side
+    return {
+        "title": title,
+        "bullets": bullets,
+        "hint": hint,
+        "message": title,
+    }
+
+
+def _friendly_row_errors_message(errors: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Group by field + message
+    from collections import defaultdict
+
+    grouped: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+    for err in errors:
+        row = err.get("row")
+        field = err.get("field")
+        msg = err.get("message")
+        grouped[field][msg].append(row)
+
+    bullets = []
+    for field, msgs in grouped.items():
+        label = FIELD_LABELS.get(field, field)
+        for msg, rows in msgs.items():
+            sample = ", ".join(str(r) for r in rows[:5])
+            count = len(rows)
+            if msg == "required":
+                human = f"{label} is missing on {count} row(s) (e.g., row {sample})."
+            else:
+                human = f"{label} {msg} on {count} row(s) (e.g., row {sample})."
+            bullets.append(f"- {human}")
+
+    title = "Some rows need attention before we can import."
+    hint = "Tip: Fix the highlighted issues and re-upload. We'll validate again instantly."
+    return {
+        "title": title,
+        "bullets": bullets,
+        "hint": hint,
+        "message": title,
+    }
+
+
 @app.get("/")
 async def root():
     return {"message": "Inventory Data Parser API", "status": "running"}
@@ -261,19 +564,28 @@ async def parse_inventory(file: UploadFile = File(...)):
     try:
         filename = (file.filename or "").lower()
         if not filename.endswith((".xlsx", ".xls")):
-            return JSONResponse(status_code=400, content={"message": "File must be an Excel file (.xlsx or .xls)"})
+            return JSONResponse(status_code=400, content={"message": "Please upload an Excel file (.xlsx or .xls)."})
 
         content = await file.read()
         try:
             df = pd.read_excel(io.BytesIO(content))
         except Exception:
-            return JSONResponse(status_code=400, content={"message": "Failed to read Excel file"})
+            return JSONResponse(status_code=400, content={"message": "We couldn't read that spreadsheet. Please check the file format and try again."})
 
         # Drop fully empty rows/columns
         df = df.dropna(axis=0, how='all')
         df = df.dropna(axis=1, how='all')
         if df.shape[0] == 0:
-            return JSONResponse(status_code=422, content={"errors": [{"row": None, "field": "file", "message": "No data rows found"}]})
+            friendly = {
+                "title": "We couldn't find any data rows.",
+                "bullets": ["Make sure your sheet has a header row and at least one data row."],
+                "message": "We couldn't find any data rows. Make sure your sheet has a header row and at least one data row.",
+            }
+            return JSONResponse(status_code=422, content={
+                "message": friendly["message"],
+                "errors": [{"row": None, "field": "file", "message": "No data rows found"}],
+                "friendly": friendly,
+            })
 
         # Build column map
         column_map = _build_column_map(df)
@@ -281,11 +593,14 @@ async def parse_inventory(file: UploadFile = File(...)):
         # Validate required mappings exist
         missing_required_cols = [f for f in REQUIRED_FIELDS if column_map.get(f) is None]
         if missing_required_cols:
+            friendly = _friendly_missing_columns_message(missing_required_cols)
             return JSONResponse(status_code=422, content={
+                "message": friendly["message"],
                 "errors": [
                     {"row": None, "field": f, "message": "required column not found"}
                     for f in missing_required_cols
-                ]
+                ],
+                "friendly": friendly,
             })
 
         # Build normalized products
@@ -344,9 +659,27 @@ async def parse_inventory(file: UploadFile = File(...)):
                 products.append(product_obj)
 
         if errors:
-            return JSONResponse(status_code=422, content={"errors": errors})
+            friendly = _friendly_row_errors_message(errors)
+            return JSONResponse(status_code=422, content={
+                "message": friendly["message"],
+                "errors": errors,
+                "friendly": friendly,
+            })
 
-        return {"products": products}
+        # Clean NaN/Inf in products to avoid JSON serialization errors
+        def _clean(obj: Any) -> Any:
+            if obj is None:
+                return None
+            if isinstance(obj, float):
+                return obj if math.isfinite(obj) else None
+            if isinstance(obj, (list, tuple)):
+                return [_clean(x) for x in obj]
+            if isinstance(obj, dict):
+                return {k: _clean(v) for k, v in obj.items()}
+            return obj
+
+        safe_products = [_clean(p) for p in products]
+        return {"products": safe_products}
 
     except HTTPException:
         raise
