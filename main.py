@@ -62,6 +62,21 @@ REQUIRED_FIELDS: List[str] = [
     "quantity",
 ]
 
+# === Service-specific target fields ===
+SERVICE_TARGET_FIELDS: List[str] = [
+    "serviceName",
+    "serviceCategory", 
+    "description",
+    "price",
+]
+
+# Required fields for services
+SERVICE_REQUIRED_FIELDS: List[str] = [
+    "serviceName",
+    "serviceCategory",
+    "price",
+]
+
 # === Synonyms for column name mapping ===
 FIELD_SYNONYMS: Dict[str, List[str]] = {
     "name": [
@@ -139,6 +154,57 @@ FIELD_SYNONYMS: Dict[str, List[str]] = {
     "quantity": ["quantity", "qty", "stock", "inventory", "available", "qtty"],
 }
 
+# === Service-specific synonyms for column name mapping ===
+SERVICE_FIELD_SYNONYMS: Dict[str, List[str]] = {
+    "serviceName": [
+        "service name",
+        "service",
+        "name",
+        "service title",
+        "title",
+        "service description",
+        "service type",
+        "offering",
+        "service offering",
+    ],
+    "serviceCategory": [
+        "service category",
+        "category",
+        "service type",
+        "type",
+        "group",
+        "classification",
+        "department",
+        "service group",
+        "service class",
+    ],
+    "description": [
+        "description",
+        "details",
+        "info",
+        "information",
+        "service details",
+        "service description",
+        "overview",
+        "summary",
+        "about",
+    ],
+    "price": [
+        "price",
+        "cost",
+        "rate",
+        "fee",
+        "charge",
+        "amount",
+        "service price",
+        "service cost",
+        "service rate",
+        "service fee",
+        "hourly rate",
+        "daily rate",
+    ],
+}
+
 # Nicer display labels for fields
 FIELD_LABELS: Dict[str, str] = {
     "name": "Name",
@@ -153,6 +219,14 @@ FIELD_LABELS: Dict[str, str] = {
     "length": "Length",
     "width": "Width",
     "quantity": "Quantity",
+}
+
+# Service-specific display labels
+SERVICE_FIELD_LABELS: Dict[str, str] = {
+    "serviceName": "Service Name",
+    "serviceCategory": "Service Category", 
+    "description": "Description",
+    "price": "Price",
 }
 
 # === Lazy-loaded embedding model ===
@@ -311,6 +385,24 @@ def _column_features(series: pd.Series) -> Dict[str, Any]:
     }
 
 
+def _service_heuristic_boost(field: str, features: Dict[str, Any]) -> float:
+    """Service-specific heuristic scoring boost based on column content analysis."""
+    boost = 0.0
+    if field == "price":
+        if features["p_numeric"] > 0.8 and features["p_integer"] < 0.9:
+            boost += 0.25
+    if field == "serviceCategory":
+        if features["low_cardinality"] and features["p_numeric"] < 0.3:
+            boost += 0.2
+    if field == "serviceName":
+        if features["p_numeric"] < 0.2 and features["avg_len"] >= 3:
+            boost += 0.25
+    if field == "description":
+        if features["p_numeric"] < 0.1 and features["avg_len"] >= 10:
+            boost += 0.15
+    return boost
+
+
 def _heuristic_boost(field: str, features: Dict[str, Any]) -> float:
     boost = 0.0
     if field == "price":
@@ -334,6 +426,110 @@ def _heuristic_boost(field: str, features: Dict[str, Any]) -> float:
         if features["p_numeric"] < 0.2 and features["avg_len"] >= 3:
             boost += 0.2
     return boost
+
+
+def _build_service_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    """Build column mapping for service fields using synonyms and semantic similarity."""
+    user_columns = list(df.columns)
+    normalized_to_original = { _normalize_header(c): c for c in user_columns }
+    normalized_user_headers = list(normalized_to_original.keys())
+
+    column_map: Dict[str, Optional[str]] = {field: None for field in SERVICE_TARGET_FIELDS}
+
+    # Pass 1: exact/synonym match on normalized headers
+    normalized_synonyms: Dict[str, List[str]] = {
+        f: [_normalize_header(s) for s in syns] for f, syns in SERVICE_FIELD_SYNONYMS.items()
+    }
+    for field, syns in normalized_synonyms.items():
+        for h_norm in normalized_user_headers:
+            if h_norm in syns:
+                column_map[field] = normalized_to_original[h_norm]
+                break
+
+    # Prepare candidates not yet used
+    unmapped_fields = [f for f, c in column_map.items() if c is None]
+    candidate_columns = [c for c in user_columns if c not in column_map.values()]
+
+    # Precompute features for candidates
+    col_features: Dict[str, Dict[str, Any]] = {
+        col: _column_features(df[col]) for col in candidate_columns
+    }
+
+    # Precompute tokens of field labels
+    field_label_tokens = { f: _tokenize(SERVICE_FIELD_LABELS.get(f, f)) for f in unmapped_fields }
+
+    # Pass 2: fuzzy token/string similarity
+    scores: List[tuple] = []  # (score, field, col)
+    for field in unmapped_fields:
+        for col in candidate_columns:
+            h = col
+            # token overlap vs the best of field label or any synonym
+            tokens_h = _tokenize(h)
+            best_tok = max([
+                _jaccard(tokens_h, _tokenize(p))
+                for p in [SERVICE_FIELD_LABELS.get(field, field)] + SERVICE_FIELD_SYNONYMS.get(field, [])
+            ] or [0.0])
+            best_str = max([
+                _string_sim(h, p)
+                for p in [SERVICE_FIELD_LABELS.get(field, field)] + SERVICE_FIELD_SYNONYMS.get(field, [])
+            ] or [0.0])
+            base = 0.35 * best_tok + 0.35 * best_str
+            base += _service_heuristic_boost(field, col_features[col])
+            if base > 0:
+                scores.append((base, field, col))
+
+    # Pass 3: semantic similarity with header-only weighting
+    if unmapped_fields and candidate_columns:
+        if _load_model_if_needed(non_blocking=False):
+            # Encode candidate headers
+            header_texts = [ _normalize_header(c) for c in candidate_columns ]
+            cand_emb = _model.encode(header_texts, convert_to_numpy=True)
+            cand_norm = np.linalg.norm(cand_emb, axis=1, keepdims=True) + 1e-12
+            cand_n = cand_emb / cand_norm
+
+            for field in unmapped_fields:
+                phrases = [SERVICE_FIELD_LABELS.get(field, field)] + SERVICE_FIELD_SYNONYMS.get(field, [])
+                field_emb = _model.encode([_normalize_header(p) for p in phrases], convert_to_numpy=True)
+                field_norm = np.linalg.norm(field_emb, axis=1, keepdims=True) + 1e-12
+                field_n = field_emb / field_norm
+                # Use the best phrase score for the field
+                # cosine matrix: candidates x phrases
+                cos = cand_n @ field_n.T
+                best_per_cand = cos.max(axis=1)
+                for idx, col in enumerate(candidate_columns):
+                    sem = float(best_per_cand[idx])
+                    if sem > 0:
+                        score = 0.8 * sem + _service_heuristic_boost(field, col_features[col])
+                        scores.append((score, field, col))
+
+            # Free embeddings
+            del cand_emb, cand_norm, cand_n
+
+    # Aggregate and choose assignments greedily by highest score with threshold
+    # Sum scores across passes
+    from collections import defaultdict
+    agg: Dict[tuple, float] = defaultdict(float)
+    for s, f, c in scores:
+        agg[(f, c)] += s
+
+    assignments = []
+    used_fields = set()
+    used_cols = set()
+    # Sort by score descending
+    for (f, c), s in sorted(agg.items(), key=lambda x: x[1], reverse=True):
+        # Minimum acceptance threshold
+        if s < 0.85:
+            continue
+        if f in used_fields or c in used_cols:
+            continue
+        assignments.append((f, c, s))
+        used_fields.add(f)
+        used_cols.add(c)
+
+    for f, c, _ in assignments:
+        column_map[f] = c
+
+    return column_map
 
 
 def _build_column_map(df: pd.DataFrame) -> Dict[str, Optional[str]]:
@@ -458,6 +654,33 @@ def re_split(text: str) -> List[str]:
     return re.split(r"[,;|]", text)
 
 
+def _service_row_errors(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Validate a service row and return list of errors."""
+    errs: List[Dict[str, Any]] = []
+
+    def add(field: str, msg: str):
+        errs.append({"row": row_idx, "field": field, "message": msg})
+
+    # Required presence (only for SERVICE_REQUIRED_FIELDS)
+    for field in SERVICE_REQUIRED_FIELDS:
+        if row.get(field) is None:
+            add(field, "required")
+
+    # Type/constraints (only if value present)
+    if row.get("price") is not None and (not isinstance(row["price"], (int, float)) or row["price"] < 0):
+        add("price", "must be a non-negative number")
+
+    # Service name must be non-empty string
+    if row.get("serviceName") is not None and (not isinstance(row["serviceName"], str) or not row["serviceName"].strip()):
+        add("serviceName", "must be a non-empty text")
+
+    # Service category must be non-empty list
+    if not isinstance(row.get("serviceCategory"), list) or len(row["serviceCategory"]) == 0:
+        add("serviceCategory", "must be a non-empty list")
+
+    return errs
+
+
 def _row_errors(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
     errs: List[Dict[str, Any]] = []
 
@@ -483,6 +706,69 @@ def _row_errors(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
         add("category", "must be a non-empty list")
 
     return errs
+
+
+def _service_friendly_missing_columns_message(missing_fields: List[str]) -> Dict[str, Any]:
+    """Generate friendly error message for missing service columns."""
+    bullets = []
+    for f in missing_fields:
+        label = SERVICE_FIELD_LABELS.get(f, f)
+        syns = SERVICE_FIELD_SYNONYMS.get(f, [])
+        syns_preview = ", ".join(syns[:4]) if syns else None
+        if syns_preview:
+            bullets.append(f"- {label}: try one of → {syns_preview}")
+        else:
+            bullets.append(f"- {label}")
+
+    title = "I couldn't find some required service columns."
+    hint = (
+        "Tip: Use clear headers. You can rename your columns to match the suggested examples above, "
+        "then re-upload."
+    )
+    return {
+        "title": title,
+        "bullets": bullets,
+        "hint": hint,
+        "message": title,
+    }
+
+
+def _service_friendly_row_errors_message(errors: List[Dict[str, Any]], column_map: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    """Generate friendly error message for service row validation errors."""
+    # Group by field + message
+    from collections import defaultdict
+
+    grouped: Dict[str, Dict[str, List[int]]] = defaultdict(lambda: defaultdict(list))
+    for err in errors:
+        row = err.get("row")
+        field = err.get("field")
+        msg = err.get("message")
+        grouped[field][msg].append(row)
+
+    bullets = []
+    for field, msgs in grouped.items():
+        original_field_name = column_map.get(field)
+        if original_field_name:
+            label = original_field_name
+        else:
+            label = SERVICE_FIELD_LABELS.get(field, field)
+        for msg, rows in msgs.items():
+            sample = ", ".join(str(r) for r in rows[:5])
+            count = len(rows)
+            if msg == "required":
+                human = f"{label} is missing on {count} row(s) (e.g., row {sample})."
+            else:
+                human = f"{label} {msg} on {count} row(s) (e.g., row {sample})."
+            bullets.append(f"- {human}")
+
+    title = "Some service rows need attention before I can import."
+    hint = "Tip: Fix the highlighted issues and re-upload. I'll validate again instantly."
+    return {
+        "title": title,
+        "bullets": bullets,
+        "hint": hint,
+        "message": title,
+    }
 
 
 def _friendly_missing_columns_message(missing_fields: List[str]) -> Dict[str, Any]:
@@ -693,6 +979,130 @@ async def parse_inventory(file: UploadFile = File(...)):
 
         safe_products = [_clean(p) for p in products]
         return {"products": safe_products}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Unexpected server error
+        return JSONResponse(status_code=500, content={"message": f"Error processing file: {str(e)}"})
+
+
+@app.post("/parse-services")
+async def parse_services(file: UploadFile = File(...)):
+    """
+    Parse and normalize service data from uploaded Excel or CSV file.
+    Returns 200 with services[] ready for Node import, or 422 with row-level errors.
+    """
+    try:
+        filename = (file.filename or "").lower()
+        if not filename.endswith((".xlsx", ".xls", ".csv")):
+            return JSONResponse(status_code=400, content={"message": "Please upload an Excel file (.xlsx, .xls) or CSV file (.csv)."})
+
+        content = await file.read()
+        try:
+            if filename.endswith(".csv"):
+                df = pd.read_csv(io.BytesIO(content))
+            else:
+                df = pd.read_excel(io.BytesIO(content))
+        except Exception:
+            return JSONResponse(status_code=400, content={"message": "We couldn't read that file. Please check the file format and try again."})
+
+        # Drop fully empty rows/columns
+        df = df.dropna(axis=0, how='all')
+        df = df.dropna(axis=1, how='all')
+        if df.shape[0] == 0:
+            friendly = {
+                "title": "I couldn't find any data rows.",
+                "bullets": ["Make sure your file has a header row and at least one data row."],
+                "message": "I couldn't find any data rows. Make sure your file has a header row and at least one data row.",
+            }
+            return JSONResponse(status_code=422, content={
+                "message": friendly["message"],
+                "errors": [{"row": None, "field": "file", "message": "No data rows found"}],
+                "friendly": friendly,
+            })
+
+        # Build column map for services
+        column_map = _build_service_column_map(df)
+
+        # Validate required mappings exist
+        missing_required_cols = [f for f in SERVICE_REQUIRED_FIELDS if column_map.get(f) is None]
+        if missing_required_cols:
+            friendly = _service_friendly_missing_columns_message(missing_required_cols)
+            return JSONResponse(status_code=422, content={
+                "message": friendly["message"],
+                "errors": [
+                    {"row": None, "field": f, "message": "required column not found"}
+                    for f in missing_required_cols
+                ],
+                "friendly": friendly,
+            })
+
+        # Build normalized services
+        services: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for idx in range(len(df)):
+            row_src = df.iloc[idx]
+
+            def get_val(field: str) -> Any:
+                col = column_map.get(field)
+                if not col:
+                    return None
+                try:
+                    val = row_src[col]
+                    if pd.isna(val) or (isinstance(val, str) and val.strip().lower() in ('', 'nan', 'none')):
+                        return None
+                    return val
+                except Exception:
+                    return None
+
+            # Extract and normalize service data
+            service_name = str(get_val("serviceName")).strip() if get_val("serviceName") is not None else None
+            category_raw = get_val("serviceCategory")
+            service_category = _normalize_category(category_raw)
+            description_raw = get_val("description")
+            description = None if description_raw is None or str(description_raw).strip() == "" else str(description_raw).strip()
+            price = _to_float(get_val("price"))
+
+            service_obj = {
+                "serviceName": service_name,
+                "serviceCategory": service_category,
+                "description": description,
+                "price": price,
+            }
+
+            row_errs = _service_row_errors(idx + 2, service_obj)  # +2 because data typically starts at row 2 (after header)
+            if row_errs:
+                errors.extend(row_errs)
+            else:
+                services.append(service_obj)
+
+        if errors:
+            friendly = _service_friendly_row_errors_message(errors, column_map)
+            return JSONResponse(status_code=422, content={
+                "message": friendly["message"],
+                "errors": errors,
+                "friendly": friendly,
+            })
+
+        # Clean NaN/Inf in services to avoid JSON serialization errors
+        def _clean(obj: Any) -> Any:
+            if obj is None:
+                return None
+            if isinstance(obj, float):
+                return obj if math.isfinite(obj) else None
+            if isinstance(obj, str) and obj.strip().lower() in ('nan', 'none'):
+                return None
+            if isinstance(obj, (list, tuple)):
+                cleaned = [_clean(x) for x in obj if _clean(x) is not None]
+                return cleaned if cleaned else None
+            if isinstance(obj, dict):
+                return {k: _clean(v) for k, v in obj.items() if _clean(v) is not None}
+            return obj
+
+        safe_services = [_clean(s) for s in services]
+        return {"services": safe_services}
 
     except HTTPException:
         raise
