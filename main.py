@@ -11,6 +11,7 @@ import math
 import difflib
 import re
 from fastapi.middleware.cors import CORSMiddleware
+from parse_v2 import parse_v2_services, parse_v2_products
 
 # FastAPI app
 app = FastAPI(title="Inventory Data Parser", description="AI-powered inventory data normalization service")
@@ -20,7 +21,18 @@ allowed_origins_env = os.environ.get("CORS_ORIGINS")
 allowed_origins = (
     [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
     if allowed_origins_env
-    else ["http://localhost:3000", "https://yachtcrewcenter.com"]
+    else [
+    'http://localhost:5174',
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'https://ycc-sage.vercel.app',
+    'https://ycc-client.vercel.app',
+    'https://ycc-client.netlify.app',
+    'https://yachtcrewcenter-dev.netlify.app',
+    'https://yachtcrewcenter.com',
+    'https://staging.yachtcrewcenter.com',
+    'https://staging.yachtcrewcenter.com/'
+]
 )
 app.add_middleware(
     CORSMiddleware,
@@ -1109,6 +1121,18 @@ async def parse_services(file: UploadFile = File(...)):
     except Exception as e:
         # Unexpected server error
         return JSONResponse(status_code=500, content={"message": f"Error processing file: {str(e)}"})
+
+
+@app.post("/parse/v2/services")
+async def parse_v2_services_endpoint(file: UploadFile = File(...)):
+    """V2 endpoint for parsing services with new schema"""
+    return await parse_v2_services(file)
+
+
+@app.post("/parse/v2/products")
+async def parse_v2_products_endpoint(file: UploadFile = File(...)):
+    """V2 endpoint for parsing products with new schema"""
+    return await parse_v2_products(file)
 
 
 # === Example Local Run (for dev testing) ===
