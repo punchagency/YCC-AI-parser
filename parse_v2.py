@@ -149,27 +149,57 @@ def _build_column_map_v2(df: pd.DataFrame, target_fields: List[str], synonyms: D
     
     return column_map
 
-def _validate_v2_service(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _validate_v2_service(row_idx: int, row: Dict[str, Any], raw_value: Dict[str, Any]) -> List[Dict[str, Any]]:
     errs = []
     for field in V2_SERVICE_REQUIRED:
         if row.get(field) is None:
-            errs.append({"row": row_idx, "field": field, "message": "required"})
+            errs.append({
+                "row": row_idx,
+                "field": field,
+                "value": raw_value.get(field),
+                "message": f"Required field '{field}' is missing or empty at row {row_idx}"
+            })
     if row.get("price") is not None and (not isinstance(row["price"], (int, float)) or row["price"] < 0):
-        errs.append({"row": row_idx, "field": "price", "message": "must be non-negative"})
+        errs.append({
+            "row": row_idx,
+            "field": "price",
+            "value": raw_value.get("price"),
+            "message": f"Field 'price' at row {row_idx} must be a non-negative number, got: {raw_value.get('price')}"
+        })
     return errs
 
-def _validate_v2_product(row_idx: int, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _validate_v2_product(row_idx: int, row: Dict[str, Any], raw_value: Dict[str, Any]) -> List[Dict[str, Any]]:
     errs = []
     for field in V2_PRODUCT_REQUIRED:
         if row.get(field) is None:
-            errs.append({"row": row_idx, "field": field, "message": "required"})
+            errs.append({
+                "row": row_idx,
+                "field": field,
+                "value": raw_value.get(field),
+                "message": f"Required field '{field}' is missing or empty at row {row_idx}"
+            })
     if row.get("price") is not None and (not isinstance(row["price"], (int, float)) or row["price"] < 0):
-        errs.append({"row": row_idx, "field": "price", "message": "must be non-negative"})
+        errs.append({
+            "row": row_idx,
+            "field": "price",
+            "value": raw_value.get("price"),
+            "message": f"Field 'price' at row {row_idx} must be a non-negative number, got: {raw_value.get('price')}"
+        })
     for dim in ["weight", "length", "width", "height"]:
         if row.get(dim) is not None and (not isinstance(row[dim], (int, float)) or row[dim] < 0):
-            errs.append({"row": row_idx, "field": dim, "message": "must be non-negative"})
+            errs.append({
+                "row": row_idx,
+                "field": dim,
+                "value": raw_value.get(dim),
+                "message": f"Field '{dim}' at row {row_idx} must be a non-negative number, got: {raw_value.get(dim)}"
+            })
     if row.get("quantity") is not None and (not isinstance(row["quantity"], int) or row["quantity"] < 0):
-        errs.append({"row": row_idx, "field": "quantity", "message": "must be non-negative integer"})
+        errs.append({
+            "row": row_idx,
+            "field": "quantity",
+            "value": raw_value.get("quantity"),
+            "message": f"Field 'quantity' at row {row_idx} must be a non-negative integer, got: {raw_value.get('quantity')}"
+        })
     return errs
 
 async def parse_v2_services(file: UploadFile = File(...)):
@@ -200,6 +230,8 @@ async def parse_v2_services(file: UploadFile = File(...)):
                 val = row_src[col]
                 return None if pd.isna(val) or (isinstance(val, str) and val.strip() == "") else val
             
+            raw_values = {field: get_val(field) for field in V2_SERVICE_FIELDS}
+            
             service = {
                 "name": str(get_val("name")).strip() if get_val("name") else None,
                 "description": str(get_val("description")).strip() if get_val("description") else None,
@@ -208,19 +240,27 @@ async def parse_v2_services(file: UploadFile = File(...)):
                 "isQuotable": _to_bool(get_val("isQuotable")),
             }
             
-            row_errs = _validate_v2_service(idx + 2, service)
+            row_errs = _validate_v2_service(idx + 2, service, raw_values)
             if row_errs:
                 errors.extend(row_errs)
             else:
                 services.append(service)
         
         if errors:
-            return JSONResponse(status_code=422, content={"message": "Validation errors", "errors": errors})
+            return JSONResponse(status_code=422, content={
+                "message": f"Validation failed: {len(errors)} error(s) found in the uploaded file",
+                "errors": errors,
+                "totalErrors": len(errors)
+            })
         
         return {"services": services}
     
+    except pd.errors.EmptyDataError:
+        return JSONResponse(status_code=422, content={"message": "The uploaded file is empty or contains no valid data"})
+    except pd.errors.ParserError as e:
+        return JSONResponse(status_code=422, content={"message": f"Failed to parse file: {str(e)}. Please ensure the file format is correct"})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"message": f"Error: {str(e)}"})
+        return JSONResponse(status_code=500, content={"message": f"Unexpected error processing services file: {str(e)}"})
 
 async def parse_v2_products(file: UploadFile = File(...)):
     try:
@@ -250,6 +290,8 @@ async def parse_v2_products(file: UploadFile = File(...)):
                 val = row_src[col]
                 return None if pd.isna(val) or (isinstance(val, str) and val.strip() == "") else val
             
+            raw_values = {field: get_val(field) for field in V2_PRODUCT_FIELDS}
+            
             product = {
                 "name": str(get_val("name")).strip() if get_val("name") else None,
                 "description": str(get_val("description")).strip() if get_val("description") else None,
@@ -270,16 +312,24 @@ async def parse_v2_products(file: UploadFile = File(...)):
                 "height": _to_float(get_val("height")),
             }
             
-            row_errs = _validate_v2_product(idx + 2, product)
+            row_errs = _validate_v2_product(idx + 2, product, raw_values)
             if row_errs:
                 errors.extend(row_errs)
             else:
                 products.append(product)
         
         if errors:
-            return JSONResponse(status_code=422, content={"message": "Validation errors", "errors": errors})
+            return JSONResponse(status_code=422, content={
+                "message": f"Validation failed: {len(errors)} error(s) found in the uploaded file",
+                "errors": errors,
+                "totalErrors": len(errors)
+            })
         
         return {"products": products}
     
+    except pd.errors.EmptyDataError:
+        return JSONResponse(status_code=422, content={"message": "The uploaded file is empty or contains no valid data"})
+    except pd.errors.ParserError as e:
+        return JSONResponse(status_code=422, content={"message": f"Failed to parse file: {str(e)}. Please ensure the file format is correct"})
     except Exception as e:
-        return JSONResponse(status_code=500, content={"message": f"Error: {str(e)}"})
+        return JSONResponse(status_code=500, content={"message": f"Unexpected error processing products file: {str(e)}"})
