@@ -11,19 +11,25 @@ import re
 from collections import defaultdict
 
 # V2 Target fields
-V2_SERVICE_FIELDS = ["name", "description", "price", "categoryName", "isQuotable"]
-V2_PRODUCT_FIELDS = ["name", "description", "price", "categoryName", "sku", "quantity", "minRestockLevel", 
+V2_SERVICE_FIELDS = ["name", "description", "price", "currency", "categoryName", "isQuotable"]
+V2_PRODUCT_FIELDS = ["name", "description", "price", "currency", "categoryName", "sku", "quantity", "minRestockLevel", 
                      "street", "city", "zipcode", "state", "country", "hsCode", "weight", "length", "width", "height"]
+
+# Supported currencies
+SUPPORTED_CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'CNY', 'INR', 'MXN',
+                        'BRL', 'ZAR', 'AED', 'SAR', 'KRW', 'SGD', 'HKD', 'NOK', 'SEK', 'DKK', 
+                        'PLN', 'THB', 'MYR', 'IDR', 'PHP', 'TRY', 'RUB', 'NZD']
 
 # Required fields
 V2_SERVICE_REQUIRED = ["name", "price", "categoryName"]
-V2_PRODUCT_REQUIRED = ["name", "price", "categoryName"]
+V2_PRODUCT_REQUIRED = ["name", "categoryName"]
 
 # Synonyms
 V2_SERVICE_SYNONYMS = {
     "name": ["name", "service name", "service", "title", "service title"],
     "description": ["description", "details", "info", "service description"],
     "price": ["price", "cost", "rate", "fee", "amount"],
+    "currency": ["currency", "curr", "currency code"],
     "categoryName": ["category name", "categoryname", "category", "service category", "type"],
     "isQuotable": ["is quotable", "isquotable", "quotable", "quote", "requires quote"],
 }
@@ -32,6 +38,7 @@ V2_PRODUCT_SYNONYMS = {
     "name": ["name", "product name", "product", "item", "title"],
     "description": ["description", "details", "info", "product description"],
     "price": ["price", "cost", "amount", "unit price"],
+    "currency": ["currency", "curr", "currency code"],
     "categoryName": ["category name", "categoryname", "category", "product category", "type"],
     "sku": ["sku", "item code", "product code", "code"],
     "quantity": ["quantity", "qty", "stock", "inventory"],
@@ -62,25 +69,45 @@ def _normalize_header(text: str) -> str:
     t = re.sub(r"[^a-z0-9 ]+", "", t)
     return re.sub(r"\s+", " ", t).strip()
 
-def _to_float(value: Any) -> Optional[float]:
+def _extract_currency_and_price(value: Any) -> tuple[Optional[str], Optional[float]]:
+    """Extract currency code and numeric price from a value."""
+    if value is None or pd.isna(value):
+        return None, None
+    
+    if isinstance(value, (int, float)):
+        f = float(value)
+        return None, (f if math.isfinite(f) else None)
+    
+    if isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            return None, None
+        
+        # Check for currency codes
+        currency = None
+        for curr in SUPPORTED_CURRENCIES:
+            if curr in s.upper():
+                currency = curr
+                s = s.upper().replace(curr, "").strip()
+                break
+        
+        # Extract numeric value
+        s = s.replace(",", "")
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+        if not m:
+            return currency, None
+        f = float(m.group(0))
+        return currency, (f if math.isfinite(f) else None)
+    
     try:
-        if value is None or pd.isna(value):
-            return None
-        if isinstance(value, (int, float)):
-            f = float(value)
-            return f if math.isfinite(f) else None
-        if isinstance(value, str):
-            s = value.strip().replace(",", "")
-            if s == "":
-                return None
-            m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
-            if not m:
-                return None
-            f = float(m.group(0))
-            return f if math.isfinite(f) else None
-        return float(value) if math.isfinite(float(value)) else None
+        f = float(value)
+        return None, (f if math.isfinite(f) else None)
     except:
-        return None
+        return None, None
+
+def _to_float(value: Any) -> Optional[float]:
+    _, price = _extract_currency_and_price(value)
+    return price
 
 def _to_int(value: Any) -> Optional[int]:
     f = _to_float(value)
@@ -178,13 +205,6 @@ def _validate_v2_product(row_idx: int, row: Dict[str, Any], raw_value: Dict[str,
                 "value": raw_value.get(field),
                 "message": f"Required field '{field}' is missing or empty at row {row_idx}"
             })
-    if row.get("price") is not None and (not isinstance(row["price"], (int, float)) or row["price"] < 0):
-        errs.append({
-            "row": row_idx,
-            "field": "price",
-            "value": raw_value.get("price"),
-            "message": f"Field 'price' at row {row_idx} must be a non-negative number, got: {raw_value.get('price')}"
-        })
     for dim in ["weight", "length", "width", "height"]:
         if row.get(dim) is not None and (not isinstance(row[dim], (int, float)) or row[dim] < 0):
             errs.append({
@@ -232,10 +252,17 @@ async def parse_v2_services(file: UploadFile = File(...)):
             
             raw_values = {field: get_val(field) for field in V2_SERVICE_FIELDS}
             
+            # Extract currency and price
+            price_val = get_val("price")
+            currency_from_price, price = _extract_currency_and_price(price_val)
+            currency_val = get_val("currency")
+            currency = str(currency_val).strip().upper() if currency_val else currency_from_price
+            
             service = {
                 "name": str(get_val("name")).strip() if get_val("name") else None,
                 "description": str(get_val("description")).strip() if get_val("description") else None,
-                "price": _to_float(get_val("price")),
+                "price": price,
+                "currency": currency if currency in SUPPORTED_CURRENCIES else None,
                 "categoryName": str(get_val("categoryName")).strip() if get_val("categoryName") else None,
                 "isQuotable": _to_bool(get_val("isQuotable")),
             }
@@ -292,10 +319,17 @@ async def parse_v2_products(file: UploadFile = File(...)):
             
             raw_values = {field: get_val(field) for field in V2_PRODUCT_FIELDS}
             
+            # Extract currency and price
+            price_val = get_val("price")
+            currency_from_price, price = _extract_currency_and_price(price_val)
+            currency_val = get_val("currency")
+            currency = str(currency_val).strip().upper() if currency_val else currency_from_price
+            
             product = {
                 "name": str(get_val("name")).strip() if get_val("name") else None,
                 "description": str(get_val("description")).strip() if get_val("description") else None,
-                "price": _to_float(get_val("price")),
+                "price": price,
+                "currency": currency if currency in SUPPORTED_CURRENCIES else None,
                 "categoryName": str(get_val("categoryName")).strip() if get_val("categoryName") else None,
                 "sku": str(get_val("sku")).strip() if get_val("sku") else None,
                 "quantity": _to_int(get_val("quantity")),
